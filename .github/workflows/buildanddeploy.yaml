@@ -1,0 +1,439 @@
+name: Build and Deploy Application
+
+on:
+  push:
+    branches: [ main, master ]
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+env:
+  # REGISTRY_ID будет получен автоматически через yc, если не установлен как секрет
+  REGISTRY_ID: ${{ secrets.REGISTRY_ID }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.set_tag.outputs.tag }}
+      image_name: ${{ steps.set_image_name.outputs.name }}
+      registry_id: ${{ steps.set_final_registry_id.outputs.registry_id }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set image tag
+        id: set_tag
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            # Если это тег, используем имя тега как есть (например, v1.0.0)
+            TAG="${{ github.ref_name }}"
+          else
+            # Если это коммит, используем SHA коммита (первые 7 символов)
+            TAG="${{ github.sha }}"
+            TAG=${TAG:0:7}
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "✓ Тег образа: $TAG"
+      
+      - name: Setup Yandex Cloud CLI
+        run: |
+          echo "Установка Yandex Cloud CLI..."
+          curl -sSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash
+          export PATH=$PATH:$HOME/yandex-cloud/bin
+          echo "$HOME/yandex-cloud/bin" >> $GITHUB_PATH
+          yc version
+      
+      - name: Configure Yandex Cloud CLI
+        env:
+          YC_SERVICE_ACCOUNT_KEY: ${{ secrets.YC_SERVICE_ACCOUNT_KEY }}
+        run: |
+          export PATH=$PATH:$HOME/yandex-cloud/bin
+          mkdir -p ~/.config
+          
+          # Проверка наличия секрета
+          if [ -z "$YC_SERVICE_ACCOUNT_KEY" ]; then
+            echo "::error::YC_SERVICE_ACCOUNT_KEY не установлен. Добавьте секрет в настройках репозитория."
+            exit 1
+          fi
+          
+          # Сохранение ключа в файл
+          printf '%s\n' "$YC_SERVICE_ACCOUNT_KEY" > ~/.config/yc_sa_key.json
+          chmod 600 ~/.config/yc_sa_key.json
+          
+          # Проверка валидности JSON (устанавливаем jq если нужно)
+          if ! command -v jq &> /dev/null; then
+            sudo apt-get update && sudo apt-get install -y jq
+          fi
+          
+          if ! jq empty ~/.config/yc_sa_key.json 2>/dev/null; then
+            echo "::error::YC_SERVICE_ACCOUNT_KEY содержит невалидный JSON. Проверьте формат секрета."
+            echo "::error::JSON должен начинаться с '{' и содержать поля: id, service_account_id, private_key, public_key"
+            echo "::error::Убедитесь, что скопирован весь JSON целиком из файла key.json"
+            exit 1
+          fi
+          echo "✓ JSON ключ валиден"
+          
+          # Настройка Yandex Cloud CLI
+          yc config set service-account-key $HOME/.config/yc_sa_key.json
+          yc config set folder-id ${{ secrets.TF_VAR_folder_id }}
+          echo "YC_SERVICE_ACCOUNT_KEY_FILE=$HOME/.config/yc_sa_key.json" >> $GITHUB_ENV
+          echo "✓ Yandex Cloud CLI настроен"
+      
+      - name: Get Container Registry ID
+        id: get_registry_id
+        if: env.REGISTRY_ID == ''
+        run: |
+          export PATH=$PATH:$HOME/yandex-cloud/bin
+          echo "Получение Container Registry ID через Yandex Cloud CLI..."
+          
+          # Устанавливаем jq для парсинга JSON
+          sudo apt-get update && sudo apt-get install -y jq
+          
+          # Получаем список registry в папке
+          REGISTRY_ID=$(yc container registry list --format json | jq -r '.[0].id // empty')
+          
+          if [ -z "$REGISTRY_ID" ]; then
+            echo "::error::Не удалось получить REGISTRY_ID. Убедитесь, что Container Registry создан в папке."
+            exit 1
+          fi
+          
+          echo "registry_id=$REGISTRY_ID" >> $GITHUB_OUTPUT
+          echo "REGISTRY_ID=$REGISTRY_ID" >> $GITHUB_ENV
+          echo "✓ Container Registry ID получен: $REGISTRY_ID"
+      
+      - name: Set final REGISTRY_ID
+        id: set_final_registry_id
+        run: |
+          # Используем REGISTRY_ID из секрета, если он есть, иначе из полученного через yc
+          if [ -n "${{ env.REGISTRY_ID }}" ]; then
+            FINAL_REGISTRY_ID="${{ env.REGISTRY_ID }}"
+            echo "✓ Используется REGISTRY_ID из секрета: $FINAL_REGISTRY_ID"
+          elif [ -n "${{ steps.get_registry_id.outputs.registry_id }}" ]; then
+            FINAL_REGISTRY_ID="${{ steps.get_registry_id.outputs.registry_id }}"
+            echo "✓ Используется REGISTRY_ID полученный через yc: $FINAL_REGISTRY_ID"
+          else
+            echo "::error::REGISTRY_ID не найден. Установите секрет REGISTRY_ID или убедитесь, что Container Registry создан."
+            exit 1
+          fi
+          echo "registry_id=$FINAL_REGISTRY_ID" >> $GITHUB_OUTPUT
+          echo "REGISTRY_ID=$FINAL_REGISTRY_ID" >> $GITHUB_ENV
+      
+      - name: Set image name
+        id: set_image_name
+        run: |
+          REGISTRY_ID="${{ steps.set_final_registry_id.outputs.registry_id }}"
+          IMAGE_NAME="cr.yandex/${REGISTRY_ID}/app-test-web:${{ steps.set_tag.outputs.tag }}"
+          echo "name=$IMAGE_NAME" >> $GITHUB_OUTPUT
+          echo "IMAGE_NAME=$IMAGE_NAME" >> $GITHUB_ENV
+          echo "✓ Имя образа: $IMAGE_NAME"
+      
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: network=host
+      
+      - name: Authenticate to Yandex Container Registry
+        run: |
+          export PATH=$PATH:$HOME/yandex-cloud/bin
+          echo "Авторизация в Yandex Container Registry..."
+          # Получаем IAM токен для авторизации в Docker
+          IAM_TOKEN=$(yc iam create-token)
+          echo "$IAM_TOKEN" | docker login --username iam --password-stdin cr.yandex
+          echo "✓ Авторизация в Container Registry выполнена"
+      
+      - name: Build application
+        run: |
+          echo "Сборка Docker образа приложения..."
+          
+          # Проверяем наличие Dockerfile в корне репозитория
+          if [ ! -f "Dockerfile" ]; then
+            echo "::error::Dockerfile не найден в корне репозитория"
+            exit 1
+          fi
+          
+          IMAGE_NAME="${{ steps.set_image_name.outputs.name }}"
+          echo "Сборка образа: $IMAGE_NAME"
+          
+          # Сборка образа
+          docker build -t $IMAGE_NAME .
+          
+          echo "✓ Образ успешно собран: $IMAGE_NAME"
+      
+      - name: Push to registry
+        run: |
+          IMAGE_NAME="${{ steps.set_image_name.outputs.name }}"
+          echo "Загрузка образа в Yandex Container Registry: $IMAGE_NAME"
+          
+          # Загрузка образа
+          docker push $IMAGE_NAME
+          
+          echo "✓ Образ успешно загружен в Container Registry: $IMAGE_NAME"
+          
+          # Если это тег, также помечаем как latest
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            REGISTRY_ID="${{ steps.set_final_registry_id.outputs.registry_id }}"
+            LATEST_IMAGE="cr.yandex/${REGISTRY_ID}/app-test-web:latest"
+            docker tag $IMAGE_NAME $LATEST_IMAGE
+            docker push $LATEST_IMAGE
+            echo "✓ Образ также помечен как latest: $LATEST_IMAGE"
+          fi
+  
+  deploy-to-production:
+    needs: build-and-push
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+      
+      - name: Setup Yandex Cloud CLI
+        run: |
+          echo "Установка Yandex Cloud CLI..."
+          curl -sSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash
+          export PATH=$PATH:$HOME/yandex-cloud/bin
+          echo "$HOME/yandex-cloud/bin" >> $GITHUB_PATH
+          yc version
+      
+      - name: Configure Yandex Cloud CLI
+        env:
+          YC_SERVICE_ACCOUNT_KEY: ${{ secrets.YC_SERVICE_ACCOUNT_KEY }}
+        run: |
+          export PATH=$PATH:$HOME/yandex-cloud/bin
+          mkdir -p ~/.config
+          
+          # Проверка наличия секрета
+          if [ -z "$YC_SERVICE_ACCOUNT_KEY" ]; then
+            echo "::error::YC_SERVICE_ACCOUNT_KEY не установлен. Добавьте секрет в настройках репозитория."
+            exit 1
+          fi
+          
+          # Установка jq для проверки JSON
+          if ! command -v jq &> /dev/null; then
+            sudo apt-get update && sudo apt-get install -y jq
+          fi
+          
+          # Сохранение ключа в файл
+          printf '%s\n' "$YC_SERVICE_ACCOUNT_KEY" > ~/.config/yc_sa_key.json
+          chmod 600 ~/.config/yc_sa_key.json
+          
+          # Диагностика: показать первые и последние символы (для отладки, без раскрытия секрета)
+          echo "Проверка формата JSON ключа..."
+          FIRST_CHAR=$(head -c 1 ~/.config/yc_sa_key.json)
+          LAST_CHAR=$(tail -c 1 ~/.config/yc_sa_key.json)
+          FILE_SIZE=$(wc -c < ~/.config/yc_sa_key.json)
+          
+          echo "Размер файла: $FILE_SIZE байт"
+          echo "Первый символ: '$FIRST_CHAR' (должен быть '{')"
+          echo "Последний символ: '$LAST_CHAR' (должен быть '}')"
+          
+          # Проверка, что файл начинается с '{'
+          if [ "$FIRST_CHAR" != "{" ]; then
+            echo "::error::JSON ключ не начинается с '{'. Возможно, в секрете есть лишние символы в начале."
+            echo "::error::Проверьте, что в секрете YC_SERVICE_ACCOUNT_KEY находится только JSON, без дополнительного текста."
+            echo "::error::Первые 50 символов (для диагностики):"
+            head -c 50 ~/.config/yc_sa_key.json | cat -A
+            exit 1
+          fi
+          
+          # Проверка валидности JSON
+          if ! jq empty ~/.config/yc_sa_key.json 2>/dev/null; then
+            echo "::error::YC_SERVICE_ACCOUNT_KEY содержит невалидный JSON."
+            echo "::error::Ошибка парсинга JSON:"
+            jq empty ~/.config/yc_sa_key.json 2>&1 || true
+            echo ""
+            echo "::error::Проверьте, что:"
+            echo "::error::1. Скопирован весь JSON целиком из файла key.json (команда: cat key.json)"
+            echo "::error::2. JSON начинается с '{' и заканчивается на '}'"
+            echo "::error::3. JSON содержит поля: id, service_account_id, created_at, key_algorithm, public_key, private_key"
+            echo "::error::4. В секрете нет лишних пробелов, кавычек или символов"
+            exit 1
+          fi
+          
+          # Проверка наличия обязательных полей
+          REQUIRED_FIELDS=("id" "service_account_id" "private_key" "public_key")
+          for field in "${REQUIRED_FIELDS[@]}"; do
+            if ! jq -e ".$field" ~/.config/yc_sa_key.json > /dev/null 2>&1; then
+              echo "::error::В JSON ключе отсутствует обязательное поле: $field"
+              exit 1
+            fi
+          done
+          
+          echo "✓ JSON ключ валиден и содержит все необходимые поля"
+          
+          # Настройка Yandex Cloud CLI
+          yc config set service-account-key $HOME/.config/yc_sa_key.json
+          yc config set folder-id ${{ secrets.TF_VAR_folder_id }}
+          echo "YC_SERVICE_ACCOUNT_KEY_FILE=$HOME/.config/yc_sa_key.json" >> $GITHUB_ENV
+          echo "✓ Yandex Cloud CLI настроен"
+      
+      - name: Get Kubernetes cluster information
+        id: k8s_info
+        run: |
+          export PATH=$PATH:$HOME/yandex-cloud/bin
+          echo "Получение Kubernetes Cluster ID через Yandex Cloud CLI..."
+          
+          # Устанавливаем jq для парсинга JSON
+          sudo apt-get update && sudo apt-get install -y jq
+          
+          # Пытаемся получить CLUSTER_ID из секрета, если он установлен
+          CLUSTER_ID="${{ secrets.K8S_CLUSTER_ID }}"
+          
+          # Если секрет не установлен, получаем через yc
+          if [ -z "$CLUSTER_ID" ]; then
+            echo "K8S_CLUSTER_ID не найден в секретах, получаем через Yandex Cloud CLI..."
+            CLUSTER_ID=$(yc managed-kubernetes cluster list --format json | jq -r '.[0].id // empty')
+            
+            if [ -z "$CLUSTER_ID" ]; then
+              echo "::error::Не удалось получить K8S_CLUSTER_ID. Убедитесь, что Kubernetes кластер создан в папке или установите секрет K8S_CLUSTER_ID."
+              exit 1
+            fi
+            echo "✓ Cluster ID получен через Yandex Cloud CLI: $CLUSTER_ID"
+          else
+            echo "✓ Cluster ID получен из секрета: $CLUSTER_ID"
+          fi
+          
+          echo "cluster_id=$CLUSTER_ID" >> $GITHUB_OUTPUT
+          echo "K8S_CLUSTER_ID=$CLUSTER_ID" >> $GITHUB_ENV
+          echo "✓ Используется Cluster ID: $CLUSTER_ID"
+      
+      - name: Get kubeconfig
+        run: |
+          export PATH=$PATH:$HOME/yandex-cloud/bin
+          mkdir -p $HOME/.kube
+          KUBECONFIG_PATH="$HOME/.kube/config"
+          
+          CLUSTER_ID="${{ steps.k8s_info.outputs.cluster_id }}"
+          if [ -z "$CLUSTER_ID" ]; then
+            echo "::error::Cluster ID не найден"
+            exit 1
+          fi
+          
+          echo "Получение kubeconfig для кластера: $CLUSTER_ID"
+          if yc managed-kubernetes cluster get-credentials "$CLUSTER_ID" --external --kubeconfig "$KUBECONFIG_PATH" 2>&1; then
+            chmod 600 "$KUBECONFIG_PATH"
+            echo "KUBECONFIG=$KUBECONFIG_PATH" >> $GITHUB_ENV
+            echo "✓ Kubeconfig сохранен в $KUBECONFIG_PATH"
+          else
+            echo "::error::Не удалось получить kubeconfig для кластера $CLUSTER_ID"
+            exit 1
+          fi
+      
+      - name: Create registry secret in Kubernetes
+        env:
+          KUBECONFIG: ${{ env.KUBECONFIG }}
+        run: |
+          export KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}"
+          export PATH=$PATH:$HOME/yandex-cloud/bin
+          echo "Создание Secret для авторизации в Container Registry..."
+          # Получаем IAM токен
+          IAM_TOKEN=$(yc iam create-token)
+          # Создаем Secret в namespace app-test-web
+          kubectl create namespace app-test-web --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create secret docker-registry yandex-registry-secret \
+            --docker-server=cr.yandex \
+            --docker-username=iam \
+            --docker-password="$IAM_TOKEN" \
+            --namespace=app-test-web \
+            --dry-run=client -o yaml | kubectl apply -f -
+          echo "✓ Secret для Container Registry создан"
+      
+      - name: Deploy to production
+        env:
+          KUBECONFIG: ${{ env.KUBECONFIG }}
+        run: |
+          export KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}"
+          echo "Деплой приложения в Kubernetes (production)..."
+          
+          # Используем образ с тегом из предыдущего шага
+          IMAGE_NAME="${{ needs.build-and-push.outputs.image_name }}"
+          echo "Деплой образа: $IMAGE_NAME"
+          
+          # Удаляем существующий Ingress для приложения, если он есть
+          echo "Удаление существующего Ingress для приложения (если есть)..."
+          kubectl delete ingress app-test-web-ingress -n app-test-web 2>/dev/null || echo "Ingress для приложения не найден, создаем новый"
+          
+          # Создание манифестов для деплоя с использованием образа с тегом
+          cat <<EOF | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: app-test-web
+            namespace: app-test-web
+          spec:
+            replicas: 2
+            selector:
+              matchLabels:
+                app: app-test-web
+            template:
+              metadata:
+                labels:
+                  app: app-test-web
+              spec:
+                imagePullSecrets:
+                - name: yandex-registry-secret
+                containers:
+                - name: app-test-web
+                  image: ${IMAGE_NAME}
+                  ports:
+                  - containerPort: 80
+                  resources:
+                    requests:
+                      memory: "128Mi"
+                      cpu: "100m"
+                    limits:
+                      memory: "256Mi"
+                      cpu: "200m"
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: app-test-web
+            namespace: app-test-web
+          spec:
+            type: ClusterIP
+            selector:
+              app: app-test-web
+            ports:
+            - port: 80
+              targetPort: 80
+          ---
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: app-test-web-ingress
+            namespace: app-test-web
+            annotations:
+              nginx.ingress.kubernetes.io/ssl-redirect: "false"
+              nginx.ingress.kubernetes.io/rewrite-target: /\$1
+              nginx.ingress.kubernetes.io/use-regex: "true"
+          spec:
+            ingressClassName: nginx
+            rules:
+            - http:
+                paths:
+                - path: /app(.*)
+                  pathType: ImplementationSpecific
+                  backend:
+                    service:
+                      name: app-test-web
+                      port:
+                        number: 80
+          EOF
+          
+          echo "Ожидание готовности приложения..."
+          kubectl wait --for=condition=available deployment/app-test-web -n app-test-web --timeout=300s || echo "Приложение может быть еще не готово"
+          echo "✓ Приложение успешно задеплоено в production с образом: $IMAGE_NAME"
+          
+          # Проверка статуса
+          echo ""
+          echo "Проверка статуса деплоя:"
+          kubectl get deployment app-test-web -n app-test-web
+          kubectl get pods -n app-test-web -l app=app-test-web
